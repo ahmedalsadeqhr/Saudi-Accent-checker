@@ -18,8 +18,8 @@ SAMPLE_PLAN = {
 def map_adi17_label(dialect_code: str) -> str:
     try:
         return ADI17_LABEL_TO_BUCKET[dialect_code]
-    except KeyError:
-        raise ValueError(f"No bucket mapping for ADI17 dialect code: {dialect_code!r}")
+    except KeyError as exc:
+        raise ValueError(f"No bucket mapping for ADI17 dialect code: {dialect_code!r}") from exc
 
 
 class AccuracyAggregator:

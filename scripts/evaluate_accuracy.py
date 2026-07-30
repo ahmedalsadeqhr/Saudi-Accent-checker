@@ -3,10 +3,11 @@
 
 Run: python scripts/evaluate_accuracy.py
 """
+import io
 import os
 import sys
 import time
-from datetime import date
+from datetime import date, datetime
 
 import requests
 
@@ -15,45 +16,47 @@ import requests
 # (scripts/) on sys.path, not the repo root, so `src`/`scripts` package imports below would
 # otherwise fail with ModuleNotFoundError. Running via `python -m scripts.evaluate_accuracy`
 # doesn't need this, but the plain script form does.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO_ROOT)
 
-from src.audio_preprocessing import to_mono, resample
-from src.config import TARGET_SAMPLE_RATE
+from src.audio_preprocessing import prepare_audio
+from src.config import DEFAULT_MODEL_SOURCE
 from src.dialect_classifier import DialectClassifier, top_result
-from scripts.eval_metrics import ADI17_LABEL_TO_BUCKET, SAMPLE_PLAN, AccuracyAggregator
+from scripts.eval_metrics import SAMPLE_PLAN, AccuracyAggregator, map_adi17_label
 
 ROWS_API_URL = "https://datasets-server.huggingface.co/rows"
 DATASET_PARAMS = {"dataset": "ArabicSpeech/ADI17", "config": "default", "split": "test"}
 PAGE_SIZE = 100
-REPORT_PATH_TEMPLATE = "docs/eval/accuracy-report-{date}.md"
+REPORT_PATH_TEMPLATE = os.path.join(REPO_ROOT, "docs", "eval", "accuracy-report-{date}.md")
 MAX_PAGE_RETRIES = 8
 MAX_BACKOFF_SEC = 30
 PAGE_REQUEST_DELAY_SEC = 0.5
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
-def _get_page_with_retry(params: dict) -> dict:
-    """GETs one page of rows, retrying with backoff on transient datasets-server failures.
+def _get_with_retry(url: str, params: dict | None = None) -> requests.Response:
+    """GETs a URL, retrying with backoff on transient network/server failures.
 
     Observed in practice while building this script: the public datasets-server API
     enforces an undocumented burst rate limit (429, no Retry-After header) that a
     straight paging loop can trip when fetching many pages back-to-back, occasionally
     stalls past a 30s read timeout under load, and intermittently returns 502 Bad
     Gateway partway through a long paging run. All are transient and worth a retry
-    rather than aborting the whole run.
+    rather than aborting the whole run. The same retry behavior applies to per-clip
+    audio downloads, which hit the same kind of transient failures.
     """
     backoff_sec = 2
     last_error: Exception | None = None
     for attempt in range(MAX_PAGE_RETRIES):
         is_last_attempt = attempt == MAX_PAGE_RETRIES - 1
         try:
-            response = requests.get(ROWS_API_URL, params=params, timeout=30)
+            response = requests.get(url, params=params, timeout=30)
         except requests.exceptions.RequestException as exc:
             last_error = exc
             if is_last_attempt:
                 raise
             print(
-                f"datasets-server request failed ({exc}) "
+                f"Request to {url} failed ({exc}) "
                 f"(attempt {attempt + 1}/{MAX_PAGE_RETRIES}); retrying in {backoff_sec}s.",
                 file=sys.stderr,
             )
@@ -62,7 +65,7 @@ def _get_page_with_retry(params: dict) -> dict:
             continue
         if response.status_code in RETRYABLE_STATUS_CODES and not is_last_attempt:
             print(
-                f"datasets-server returned HTTP {response.status_code} "
+                f"Request to {url} returned HTTP {response.status_code} "
                 f"(attempt {attempt + 1}/{MAX_PAGE_RETRIES}); retrying in {backoff_sec}s.",
                 file=sys.stderr,
             )
@@ -70,10 +73,20 @@ def _get_page_with_retry(params: dict) -> dict:
             backoff_sec = min(backoff_sec * 2, MAX_BACKOFF_SEC)
             continue
         response.raise_for_status()
-        return response.json()
+        return response
     raise last_error or requests.exceptions.RequestException(
-        "Exhausted retries against datasets-server rows API"
+        f"Exhausted retries against {url}"
     )
+
+
+def _get_page_with_retry(params: dict) -> dict:
+    """GETs one page of rows from the datasets-server rows API, retrying on transient failures."""
+    return _get_with_retry(ROWS_API_URL, params=params).json()
+
+
+def _download_audio_with_retry(audio_url: str) -> bytes:
+    """Downloads a clip's audio bytes, retrying on transient failures."""
+    return _get_with_retry(audio_url).content
 
 
 def find_labeled_clip_urls() -> list:
@@ -94,31 +107,21 @@ def find_labeled_clip_urls() -> list:
                 found.append((dialect_code, audio_url))
                 remaining[dialect_code] -= 1
         offset += PAGE_SIZE
-        if offset >= payload.get("num_rows_total", offset):
+        if offset >= payload.get("num_rows_total", float("inf")):
             break
         time.sleep(PAGE_REQUEST_DELAY_SEC)
     return found
 
 
-def evaluate() -> AccuracyAggregator:
+def evaluate(clip_urls: list) -> AccuracyAggregator:
     classifier = DialectClassifier()
     aggregator = AccuracyAggregator()
 
-    clip_urls = find_labeled_clip_urls()
-    print(f"Found {len(clip_urls)} labeled clips to evaluate.")
-
     for dialect_code, audio_url in clip_urls:
         try:
-            truth_bucket = ADI17_LABEL_TO_BUCKET[dialect_code]
-            audio_response = requests.get(audio_url, timeout=30)
-            audio_response.raise_for_status()
-
-            import io
-            import soundfile as sf
-
-            waveform, sample_rate = sf.read(io.BytesIO(audio_response.content), dtype="float32")
-            mono = to_mono(waveform)
-            resampled = resample(mono, orig_sr=sample_rate, target_sr=TARGET_SAMPLE_RATE)
+            truth_bucket = map_adi17_label(dialect_code)
+            audio_bytes = _download_audio_with_retry(audio_url)
+            resampled = prepare_audio(io.BytesIO(audio_bytes))
 
             scores = classifier.predict(resampled)
             predicted_label, _ = top_result(scores)
@@ -130,8 +133,20 @@ def evaluate() -> AccuracyAggregator:
     return aggregator
 
 
-def build_report(aggregator: AccuracyAggregator) -> str:
+def build_report(aggregator: AccuracyAggregator, clip_urls_found: int) -> str:
     lines = ["# Accuracy Evaluation Report", ""]
+    lines.append(f"Model: {DEFAULT_MODEL_SOURCE}")
+    lines.append("Dataset: ArabicSpeech/ADI17 (test split, via datasets-server.huggingface.co)")
+    lines.append(f"Sample plan: {SAMPLE_PLAN}")
+    lines.append(f"Generated: {datetime.now().isoformat()}")
+    lines.append("")
+    sample_plan_total = sum(SAMPLE_PLAN.values())
+    if clip_urls_found < sample_plan_total:
+        lines.append(
+            f"Note: only found {clip_urls_found}/{sample_plan_total} planned clips "
+            "(dataset exhausted or match not found for some labels)."
+        )
+        lines.append("")
     lines.append(f"Overall accuracy: {aggregator.overall_accuracy():.1%} ({aggregator.correct}/{aggregator.total})")
     lines.append(f"Skipped clips: {aggregator.skipped}")
     lines.append("")
@@ -153,12 +168,25 @@ def build_report(aggregator: AccuracyAggregator) -> str:
 
 def main() -> None:
     try:
-        aggregator = evaluate()
+        clip_urls = find_labeled_clip_urls()
     except requests.exceptions.RequestException as exc:
         print(f"Could not reach the Hugging Face datasets-server API: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    report = build_report(aggregator)
+    print(f"Found {len(clip_urls)} labeled clips to evaluate.")
+
+    aggregator = evaluate(clip_urls)
+
+    if aggregator.total == 0:
+        print(
+            "Every clip failed to evaluate (0/0 scored) — refusing to write a misleading "
+            "0.0% report. Check network connectivity, the datasets-server API, and the "
+            "classifier's model source.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    report = build_report(aggregator, clip_urls_found=len(clip_urls))
     print("\n" + report)
 
     report_path = REPORT_PATH_TEMPLATE.format(date=date.today().isoformat())
