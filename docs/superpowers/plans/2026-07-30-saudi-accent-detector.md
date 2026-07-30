@@ -4,16 +4,17 @@
 
 **Goal:** Build a Streamlit app where a user records or uploads Arabic speech and gets back confidence scores per Arabic dialect, with the Saudi/Gulf (KSA) class highlighted — using a free, local, pretrained model (no paid APIs).
 
-**Architecture:** A single Streamlit app (`app.py`) calls into two small pure-Python modules: `src/audio_preprocessing.py` (validates and normalizes incoming audio) and `src/dialect_classifier.py` (wraps a pretrained SpeechBrain dialect-ID model and returns per-dialect scores). Config constants (model source, sample rate, thresholds) live in `src/config.py` so the model can be swapped for a fine-tuned checkpoint later without touching app code.
+**Architecture:** A single Streamlit app (`app.py`) calls into two small pure-Python modules: `src/audio_preprocessing.py` (validates and normalizes incoming audio) and `src/dialect_classifier.py` (wraps a pretrained `transformers` audio-classification model and returns per-dialect scores). Config constants (model source, sample rate, thresholds) live in `src/config.py` so the model can be swapped for a fine-tuned checkpoint later without touching app code.
 
-**Tech Stack:** Python 3.10+, Streamlit, SpeechBrain, PyTorch/torchaudio, soundfile, pydub (+ system ffmpeg), pytest.
+**Tech Stack:** Python 3.10+, Streamlit, Hugging Face `transformers`, PyTorch/torchaudio, soundfile, pydub (+ system ffmpeg), pytest.
 
 ## Global Constraints
 
 - No paid/cloud APIs — all inference runs locally.
 - Target sample rate for the model: 16000 Hz, mono (from spec).
 - Minimum accepted audio duration: 1.0 second (from spec) — shorter/silent input is rejected before running the model.
-- Pretrained model: `Elyadata/ADI-whisper-ADI17` (SpeechBrain, ADI17 corpus — 17 Arabic dialects including Saudi/Gulf `KSA`). Model source is a config value, not hardcoded inline, so it can be swapped for a fine-tuned checkpoint later.
+- Pretrained model: `badrex/mms-300m-arabic-dialect-identifier` (`transformers` `audio-classification` pipeline, MMS-300m fine-tuned on 5 Arabic varieties: Maghrebi, MSA, Egyptian, Gulf, Levantine — Saudi is represented by the `Gulf` label). Model source is a config value, not hardcoded inline, so it can be swapped for a fine-tuned checkpoint later.
+  - **Deviation note:** the plan originally pinned `Elyadata/ADI-whisper-ADI17` (SpeechBrain). That model turned out to require custom SpeechBrain interface code cloned from a separate GitHub repo (not bundled on Hugging Face) plus a ~2.5-5GB Whisper-large-v3 checkpoint. Discovered during Task 3 implementation and swapped, with the human partner's approval, for the lighter model above, which works with the standard `transformers` pipeline (no custom code, no git clone, ~0.3B params, CC BY 4.0 licensed).
 - No natural-language explanation of *why* — label + confidence scores only (out of scope per spec).
 - No language-detection gate for non-Arabic input (out of scope per spec) — note the limitation in the UI copy only.
 
@@ -28,17 +29,20 @@
 - Create: `pytest.ini`
 
 **Interfaces:**
-- Produces: `src.config.TARGET_SAMPLE_RATE: int`, `src.config.MIN_AUDIO_DURATION_SEC: float`, `src.config.DEFAULT_MODEL_SOURCE: str`, `src.config.MODEL_SAVE_DIR: str`, `src.config.SAUDI_LABEL_ALIASES: frozenset[str]`
+- Produces: `src.config.TARGET_SAMPLE_RATE: int`, `src.config.MIN_AUDIO_DURATION_SEC: float`, `src.config.DEFAULT_MODEL_SOURCE: str`, `src.config.SAUDI_LABEL_ALIASES: frozenset[str]`
+
+> **Superseded by the Task 3 model-swap deviation (see Global Constraints):** as originally executed, this task installed `speechbrain` instead of `transformers`, pinned `DEFAULT_MODEL_SOURCE = "Elyadata/ADI-whisper-ADI17"`, defined a now-unused `MODEL_SAVE_DIR`, and set `SAUDI_LABEL_ALIASES = frozenset({"KSA", "SAU", "SA"})`. Task 3 updates `requirements.txt` and `src/config.py` to the values below as part of its own commits — this section is left as a historical record of what Task 1 actually did; the blocks below show the corrected target state.
 
 - [ ] **Step 1: Create `requirements.txt`**
 
 ```text
 streamlit>=1.38
-speechbrain>=1.0
+transformers>=4.40
 torch>=2.2
 torchaudio>=2.2
 soundfile>=0.12
 pydub>=0.25
+audioop-lts>=0.2.1
 numpy>=1.26
 pytest>=8.0
 ```
@@ -51,12 +55,11 @@ pytest>=8.0
 TARGET_SAMPLE_RATE = 16000
 MIN_AUDIO_DURATION_SEC = 1.0
 
-DEFAULT_MODEL_SOURCE = "Elyadata/ADI-whisper-ADI17"
-MODEL_SAVE_DIR = "pretrained_models/dialect_id"
+DEFAULT_MODEL_SOURCE = "badrex/mms-300m-arabic-dialect-identifier"
 
-# ADI17 label conventions vary in case/format across model releases; match
-# any of these against a normalized (upper, stripped) label string.
-SAUDI_LABEL_ALIASES = frozenset({"KSA", "SAU", "SA"})
+# This model's label set groups Saudi in with the broader "Gulf" class.
+# Match case-insensitively against a normalized (upper, stripped) label string.
+SAUDI_LABEL_ALIASES = frozenset({"GULF"})
 ```
 
 - [ ] **Step 4: Create `pytest.ini`**
@@ -70,7 +73,7 @@ markers =
 
 - [ ] **Step 5: Install dependencies and verify imports**
 
-Run: `pip install -r requirements.txt && python -c "import streamlit, speechbrain, torch, torchaudio, soundfile, pydub; from src import config; print(config.TARGET_SAMPLE_RATE)"`
+Run: `pip install -r requirements.txt && python -c "import streamlit, transformers, torch, torchaudio, soundfile, pydub; from src import config; print(config.TARGET_SAMPLE_RATE)"`
 Expected: prints `16000` with no import errors.
 
 - [ ] **Step 6: Commit**
@@ -312,70 +315,92 @@ git commit -m "feat: add audio preprocessing (mono, resample, duration validatio
 ### Task 3: Dialect classifier wrapper
 
 **Files:**
+- Modify: `requirements.txt` (replace `speechbrain>=1.0` with `transformers>=4.40`, add `audioop-lts>=0.2.1` if not already present)
+- Modify: `src/config.py` (update `DEFAULT_MODEL_SOURCE` and `SAUDI_LABEL_ALIASES`, remove `MODEL_SAVE_DIR`)
 - Create: `src/dialect_classifier.py`
 - Test: `tests/test_dialect_classifier.py`
 
 **Interfaces:**
-- Consumes: `src.config.DEFAULT_MODEL_SOURCE`, `src.config.MODEL_SAVE_DIR`, `src.config.SAUDI_LABEL_ALIASES`, `src.audio_preprocessing.prepare_audio`
+- Consumes: `src.config.DEFAULT_MODEL_SOURCE`, `src.config.SAUDI_LABEL_ALIASES`, `src.audio_preprocessing.prepare_audio`
 - Produces:
-  - `src.dialect_classifier.DialectClassifier(model_source: str = DEFAULT_MODEL_SOURCE, save_dir: str = MODEL_SAVE_DIR)` — class with:
-    - `.predict(waveform: np.ndarray) -> dict[str, float]` — dialect label → probability, sorted descending by probability.
+  - `src.dialect_classifier.DialectClassifier(model_source: str = DEFAULT_MODEL_SOURCE)` — class with:
+    - `.predict(waveform: np.ndarray, sample_rate: int = TARGET_SAMPLE_RATE) -> dict[str, float]` — dialect label → probability, sorted descending by probability.
     - `.is_saudi_label(label: str) -> bool` — normalizes and checks against `SAUDI_LABEL_ALIASES`.
   - `src.dialect_classifier.top_result(scores: dict[str, float]) -> tuple[str, float]` — returns the `(label, probability)` pair with the highest probability.
 
-- [ ] **Step 1: Write failing unit tests using a fake underlying model (no download)**
+**Model note:** uses `badrex/mms-300m-arabic-dialect-identifier` via the standard `transformers` `pipeline("audio-classification", ...)` API — no custom inference code, no git clone. Its 5 output labels are `Maghrebi`, `MSA`, `Egyptian`, `Gulf`, `Levantine`; Saudi Arabic falls under `Gulf`.
+
+- [ ] **Step 0: Update `requirements.txt` and `src/config.py` to the corrected model**
+
+In `requirements.txt`, replace the `speechbrain>=1.0` line with `transformers>=4.40`, and add `audioop-lts>=0.2.1` if it isn't already present from Task 1's fix round. Rewrite `src/config.py` to:
+
+```python
+TARGET_SAMPLE_RATE = 16000
+MIN_AUDIO_DURATION_SEC = 1.0
+
+DEFAULT_MODEL_SOURCE = "badrex/mms-300m-arabic-dialect-identifier"
+
+# This model's label set groups Saudi in with the broader "Gulf" class.
+# Match case-insensitively against a normalized (upper, stripped) label string.
+SAUDI_LABEL_ALIASES = frozenset({"GULF"})
+```
+
+Run `python -c "import transformers; from src import config; print(config.DEFAULT_MODEL_SOURCE)"` and confirm it prints the model name with no import errors. Commit this alone first:
+
+```bash
+git add requirements.txt src/config.py
+git commit -m "fix: switch to badrex/mms-300m-arabic-dialect-identifier (transformers pipeline)"
+```
+
+- [ ] **Step 1: Write failing unit tests using a fake underlying pipeline (no download)**
 
 These tests verify the wrapper's scoring/formatting logic without needing the real
-~1GB pretrained model, by injecting a fake SpeechBrain-shaped classifier.
+model download, by injecting a fake `transformers` pipeline callable.
 
 ```python
 # tests/test_dialect_classifier.py
 import numpy as np
 import pytest
-import torch
 
 from src.dialect_classifier import DialectClassifier, top_result
 
 
-class _FakeSpeechBrainModel:
-    """Mimics the subset of SpeechBrain's classify_batch return shape we depend on."""
-
-    def classify_batch(self, batch, wav_lens):
-        out_prob = torch.tensor([[0.7, 0.2, 0.1]])
-        score, index = torch.max(out_prob, dim=-1)
-        text_lab = [["ksa", "egy", "lev"][index.item()]]
-        return out_prob, score, index, text_lab
+def _fake_pipeline(audio_input, top_k=None):
+    return [
+        {"label": "Gulf", "score": 0.7},
+        {"label": "Egyptian", "score": 0.2},
+        {"label": "Levantine", "score": 0.1},
+    ]
 
 
 @pytest.fixture
 def classifier():
     instance = DialectClassifier.__new__(DialectClassifier)
-    instance._model = _FakeSpeechBrainModel()
-    instance._labels = ["ksa", "egy", "lev"]
+    instance._pipe = _fake_pipeline
     return instance
 
 
 def test_predict_returns_label_to_probability_mapping(classifier):
     waveform = np.zeros(16000, dtype=np.float32)
     scores = classifier.predict(waveform)
-    assert scores == {"ksa": pytest.approx(0.7), "egy": pytest.approx(0.2), "lev": pytest.approx(0.1)}
+    assert scores == {"Gulf": pytest.approx(0.7), "Egyptian": pytest.approx(0.2), "Levantine": pytest.approx(0.1)}
 
 
 def test_predict_is_sorted_descending_by_probability(classifier):
     waveform = np.zeros(16000, dtype=np.float32)
     scores = classifier.predict(waveform)
-    assert list(scores.keys()) == ["ksa", "egy", "lev"]
+    assert list(scores.keys()) == ["Gulf", "Egyptian", "Levantine"]
 
 
-def test_is_saudi_label_matches_known_aliases_case_insensitively(classifier):
-    assert classifier.is_saudi_label("ksa") is True
-    assert classifier.is_saudi_label("KSA") is True
-    assert classifier.is_saudi_label("egy") is False
+def test_is_saudi_label_matches_gulf_case_insensitively(classifier):
+    assert classifier.is_saudi_label("Gulf") is True
+    assert classifier.is_saudi_label("GULF") is True
+    assert classifier.is_saudi_label("Egyptian") is False
 
 
 def test_top_result_returns_highest_probability_pair():
-    scores = {"ksa": 0.7, "egy": 0.2, "lev": 0.1}
-    assert top_result(scores) == ("ksa", 0.7)
+    scores = {"Gulf": 0.7, "Egyptian": 0.2, "Levantine": 0.1}
+    assert top_result(scores) == ("Gulf", 0.7)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -388,23 +413,18 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'src.dialect_classifie
 ```python
 # src/dialect_classifier.py
 import numpy as np
-import torch
-from speechbrain.inference.classifiers import EncoderClassifier
+from transformers import pipeline
 
-from src.config import DEFAULT_MODEL_SOURCE, MODEL_SAVE_DIR, SAUDI_LABEL_ALIASES
+from src.config import DEFAULT_MODEL_SOURCE, SAUDI_LABEL_ALIASES, TARGET_SAMPLE_RATE
 
 
 class DialectClassifier:
-    def __init__(self, model_source: str = DEFAULT_MODEL_SOURCE, save_dir: str = MODEL_SAVE_DIR):
-        self._model = EncoderClassifier.from_hparams(source=model_source, savedir=save_dir)
-        self._labels = list(self._model.hparams.label_encoder.ind2lab.values())
+    def __init__(self, model_source: str = DEFAULT_MODEL_SOURCE):
+        self._pipe = pipeline("audio-classification", model=model_source)
 
-    def predict(self, waveform: np.ndarray) -> dict[str, float]:
-        batch = torch.from_numpy(waveform).float().unsqueeze(0)
-        wav_lens = torch.tensor([1.0])
-        out_prob, _, _, _ = self._model.classify_batch(batch, wav_lens)
-        probabilities = out_prob.squeeze(0).tolist()
-        scores = dict(zip(self._labels, probabilities))
+    def predict(self, waveform: np.ndarray, sample_rate: int = TARGET_SAMPLE_RATE) -> dict[str, float]:
+        results = self._pipe({"array": waveform, "sampling_rate": sample_rate}, top_k=None)
+        scores = {result["label"]: result["score"] for result in results}
         return dict(sorted(scores.items(), key=lambda item: item[1], reverse=True))
 
     def is_saudi_label(self, label: str) -> bool:
@@ -418,7 +438,7 @@ def top_result(scores: dict) -> tuple:
 - [ ] **Step 4: Run unit tests to verify they pass**
 
 Run: `pytest tests/test_dialect_classifier.py -v -m "not integration"`
-Expected: the 4 fake-model tests PASS.
+Expected: the 4 fake-pipeline tests PASS.
 
 - [ ] **Step 5: Write an integration test against the real pretrained model**
 
@@ -441,13 +461,13 @@ def test_real_model_loads_and_predicts_on_silence():
 - [ ] **Step 6: Run the integration test to verify it passes**
 
 Run: `pytest tests/test_dialect_classifier.py -v -m integration`
-Expected: PASS (first run downloads the model checkpoint into `pretrained_models/dialect_id`; this can take a few minutes).
+Expected: PASS (first run downloads the ~0.3B-parameter model via the `transformers`/Hugging Face cache; this can take a few minutes).
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add src/dialect_classifier.py tests/test_dialect_classifier.py
-git commit -m "feat: add dialect classifier wrapper around pretrained SpeechBrain model"
+git commit -m "feat: add dialect classifier wrapper around pretrained transformers pipeline"
 ```
 
 ---
@@ -578,8 +598,8 @@ streamlit run app.py
 Open the printed local URL (and the "Network URL" to let teammates on the same
 network access it).
 
-The first prediction downloads the pretrained model (`Elyadata/ADI-whisper-ADI17`)
-into `pretrained_models/dialect_id/` — this can take a few minutes and needs
+The first prediction downloads the pretrained model (`badrex/mms-300m-arabic-dialect-identifier`)
+into the local Hugging Face cache — this can take a few minutes and needs
 internet access once, then works offline.
 
 ## Tests
@@ -592,8 +612,8 @@ pytest -m integration         # slow, downloads/runs the real model
 ## Fine-tuning later
 
 To use your own fine-tuned checkpoint instead of the stock pretrained model,
-point `src/config.py`'s `DEFAULT_MODEL_SOURCE` (and `MODEL_SAVE_DIR` if needed)
-at your checkpoint's location — no other code changes required.
+point `src/config.py`'s `DEFAULT_MODEL_SOURCE` at your checkpoint's local path
+or Hugging Face repo — no other code changes required.
 ```
 
 - [ ] **Step 2: Verify the README's commands work as documented**
