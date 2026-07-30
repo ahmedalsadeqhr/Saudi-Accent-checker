@@ -4,5 +4,6 @@ torch>=2.2
 torchaudio>=2.2
 soundfile>=0.12
 pydub>=0.25
+audioop-lts>=0.2.1
 numpy>=1.26
 pytest>=8.0
