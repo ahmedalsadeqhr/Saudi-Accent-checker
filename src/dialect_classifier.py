@@ -18,4 +18,4 @@ class DialectClassifier:
 
 
 def top_result(scores: dict) -> tuple:
-    return next(iter(scores.items()))
+    return max(scores.items(), key=lambda item: item[1])

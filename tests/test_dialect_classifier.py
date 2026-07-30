@@ -42,6 +42,10 @@ def test_top_result_returns_highest_probability_pair():
     assert top_result(scores) == ("Gulf", 0.7)
 
 
+def test_top_result_finds_max_independent_of_dict_order():
+    assert top_result({"a": 0.1, "b": 0.9, "c": 0.3}) == ("b", 0.9)
+
+
 @pytest.mark.integration
 def test_real_model_loads_and_predicts_on_silence():
     """Downloads the real pretrained model on first run (slow, needs internet)."""
@@ -53,3 +57,4 @@ def test_real_model_loads_and_predicts_on_silence():
     label, probability = top_result(scores)
     assert isinstance(label, str)
     assert 0.0 <= probability <= 1.0
+    assert any(classifier.is_saudi_label(label) for label in scores)

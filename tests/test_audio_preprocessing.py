@@ -1,11 +1,16 @@
+import io
+
 import numpy as np
 import pytest
+import soundfile as sf
 
 from src.audio_preprocessing import (
     AudioTooShortError,
     UnsupportedAudioError,
-    to_mono,
+    load_audio,
+    prepare_audio,
     resample,
+    to_mono,
     validate_duration,
 )
 
@@ -45,12 +50,6 @@ def test_validate_duration_raises_when_too_short():
 def test_validate_duration_passes_when_long_enough():
     long_waveform = np.zeros(16000)  # exactly 1.0s at 16000 Hz
     validate_duration(long_waveform, sample_rate=16000, min_duration_sec=1.0)  # no raise
-
-
-import io
-import soundfile as sf
-
-from src.audio_preprocessing import load_audio, prepare_audio
 
 
 def _write_wav_bytes(samples: np.ndarray, sample_rate: int) -> io.BytesIO:

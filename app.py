@@ -17,28 +17,32 @@ def get_classifier() -> DialectClassifier:
     return DialectClassifier()
 
 
+try:
+    classifier = get_classifier()
+except Exception as exc:
+    st.error(
+        f"Failed to load the dialect model: {exc}. Check your internet connection "
+        "or Hugging Face cache and reload the page."
+    )
+    st.stop()
+
+
 def render_scores(scores: dict) -> None:
     label, probability = top_result(scores)
-    classifier = get_classifier()
-    if classifier.is_saudi_label(label):
+    if get_classifier().is_saudi_label(label):
         st.success(f"Top match: **{label}** (Saudi/Gulf) — {probability:.0%} confidence")
     else:
         st.info(f"Top match: **{label}** — {probability:.0%} confidence (not Saudi/Gulf)")
     st.bar_chart(scores)
 
 
-tab_record, tab_upload = st.tabs(["Record", "Upload a file"])
+input_source = st.radio("Input source", ["Record", "Upload a file"], horizontal=True)
 
 audio_input = None
-with tab_record:
-    recorded = st.audio_input("Record yourself speaking Arabic")
-    if recorded is not None:
-        audio_input = recorded
-
-with tab_upload:
-    uploaded = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a"])
-    if uploaded is not None:
-        audio_input = uploaded
+if input_source == "Record":
+    audio_input = st.audio_input("Record yourself speaking Arabic")
+else:
+    audio_input = st.file_uploader("Upload an audio file", type=["wav", "mp3", "m4a"])
 
 if audio_input is not None:
     try:
