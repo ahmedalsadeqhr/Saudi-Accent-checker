@@ -37,3 +37,18 @@ pytest -m integration         # slow, downloads/runs the real model
 To use your own fine-tuned checkpoint instead of the stock pretrained model,
 point `src/config.py`'s `DEFAULT_MODEL_SOURCE` at your checkpoint's local path
 or Hugging Face repo — no other code changes required.
+
+## Accuracy evaluation
+
+To measure the deployed model's accuracy against labeled ground truth from the public
+`ArabicSpeech/ADI17` dataset (weighted toward the Saudi/Gulf case):
+
+```bash
+pip install requests  # if not already installed
+python scripts/evaluate_accuracy.py
+```
+
+This fetches ~75 labeled clips over the network (no local dataset download), classifies
+each with the current model, and writes a report to `docs/eval/accuracy-report-<date>.md`
+with overall accuracy, per-dialect accuracy, and a confusion matrix. Note: Modern Standard
+Arabic (MSA) isn't evaluated against ground truth — the source dataset has no MSA samples.

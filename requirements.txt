@@ -7,3 +7,4 @@ pydub>=0.25
 audioop-lts>=0.2.1
 numpy>=1.26
 pytest>=8.0
+requests>=2.32
