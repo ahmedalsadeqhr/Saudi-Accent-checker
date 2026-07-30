@@ -45,3 +45,50 @@ def test_validate_duration_raises_when_too_short():
 def test_validate_duration_passes_when_long_enough():
     long_waveform = np.zeros(16000)  # exactly 1.0s at 16000 Hz
     validate_duration(long_waveform, sample_rate=16000, min_duration_sec=1.0)  # no raise
+
+
+import io
+import soundfile as sf
+
+from src.audio_preprocessing import load_audio, prepare_audio
+
+
+def _write_wav_bytes(samples: np.ndarray, sample_rate: int) -> io.BytesIO:
+    buffer = io.BytesIO()
+    sf.write(buffer, samples, sample_rate, format="WAV")
+    buffer.seek(0)
+    return buffer
+
+
+def test_load_audio_reads_wav_buffer():
+    samples = np.sin(np.linspace(0, 2 * np.pi, 8000)).astype(np.float32)
+    buffer = _write_wav_bytes(samples, sample_rate=8000)
+
+    waveform, sample_rate = load_audio(buffer)
+
+    assert sample_rate == 8000
+    assert waveform.shape[0] == 8000
+
+
+def test_load_audio_raises_on_garbage_bytes():
+    garbage = io.BytesIO(b"not an audio file at all")
+    with pytest.raises(UnsupportedAudioError):
+        load_audio(garbage)
+
+
+def test_prepare_audio_returns_mono_16k_waveform_long_enough():
+    two_seconds_at_8k = np.sin(np.linspace(0, 4 * np.pi, 16000)).astype(np.float32)
+    buffer = _write_wav_bytes(two_seconds_at_8k, sample_rate=8000)
+
+    result = prepare_audio(buffer)
+
+    assert result.ndim == 1
+    assert result.shape[0] == 32000  # 2s resampled to 16000 Hz
+
+
+def test_prepare_audio_raises_audio_too_short_error():
+    half_second_at_16k = np.zeros(8000, dtype=np.float32)
+    buffer = _write_wav_bytes(half_second_at_16k, sample_rate=16000)
+
+    with pytest.raises(AudioTooShortError):
+        prepare_audio(buffer)
